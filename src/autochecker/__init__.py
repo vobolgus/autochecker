@@ -173,16 +173,28 @@ RUBRIC_SCHEMA = {
 RUBRIC_PROMPT = """\
 Look at the attached worked-solutions pages and extract the grading rubric.
 
-For each question in the problem set, return:
-  - "id":     the question label exactly as written (e.g. "1", "2a", "Задача 3")
-  - "points": the maximum points for that question (positive integer)
+List EVERY atomic scorable item. If a question breaks into sub-parts (e.g. \
+"part a" / "part b", explicit points for 1.1 and 1.2, separate points for \
+each step in the solution), list each sub-part as its own item with its own \
+points. If a question has no sub-parts, list it as a single item.
+
+For each item return:
+  - "id":     the label as it appears in the document. Use dotted notation \
+for sub-parts: "1.1", "1.2", "2.3a", etc. Plain "1", "2" for items without \
+sub-parts.
+  - "points": the maximum points for that atomic item (positive integer)
 
 Return JSON of the form:
-  {"questions": [{"id": "1", "points": 2}, {"id": "2", "points": 3}, ...]}
+  {"questions": [
+      {"id": "1.1", "points": 4},
+      {"id": "1.2", "points": 6},
+      {"id": "2",   "points": 8},
+      ...
+  ]}
 
-Preserve the order the questions appear in the document. If point values are \
-not explicitly printed, infer reasonable integers from context. Do not run \
-tools, do not ask clarifying questions.
+Preserve the order items appear in the document. If point values aren't \
+printed, infer reasonable integers so that each top-level question's parts \
+sum to the intended total. Do not run tools, do not ask questions.
 """
 
 NAME_DETECT_SCHEMA = {
@@ -998,12 +1010,32 @@ def run_grading(state: dict):
             )
             rubric = dict(DEFAULT_RUBRIC)
 
-        rubric_preview = "  ".join(f"{qid}:{pts}" for qid, pts in rubric.items())
-        console.print(
-            f"  [success]Rubric:[/] [bold]{len(rubric)}[/] questions · "
-            f"[bold]{sum(rubric.values())}[/] points total   "
-            f"[muted]({rubric_preview})[/]"
-        )
+        # Group by top-level question for compact display when sub-parts exist.
+        by_top: dict[str, list[tuple[str, int]]] = defaultdict(list)
+        for qid, pts in rubric.items():
+            top = qid.split(".", 1)[0]
+            by_top[top].append((qid, pts))
+        has_subs = any(len(parts) > 1 for parts in by_top.values())
+
+        if has_subs:
+            rubric_preview = "  ".join(
+                f"Q{top}: {sum(p for _, p in parts)}pts"
+                f"{' (' + str(len(parts)) + ' parts)' if len(parts) > 1 else ''}"
+                for top, parts in by_top.items()
+            )
+            header = (
+                f"  [success]Rubric:[/] [bold]{len(by_top)}[/] questions · "
+                f"[bold]{len(rubric)}[/] atomic items · "
+                f"[bold]{sum(rubric.values())}[/] points total"
+            )
+        else:
+            rubric_preview = "  ".join(f"{qid}:{pts}" for qid, pts in rubric.items())
+            header = (
+                f"  [success]Rubric:[/] [bold]{len(rubric)}[/] questions · "
+                f"[bold]{sum(rubric.values())}[/] points total"
+            )
+        console.print(header)
+        console.print(f"          [muted]{rubric_preview}[/]")
         if not Confirm.ask("  [bold]Use this rubric?[/]", default=True):
             console.print("  [muted]Aborted. Edit the solutions file or tweak "
                           "the rubric manually and retry.[/]")
@@ -1167,10 +1199,25 @@ def render_results(grades: dict, rubric: dict[str, int],
         table.add_column("Signed as", no_wrap=True)
     if has_matches:
         table.add_column("Matched To", no_wrap=True)
+
+    # Column labels — prefix with "Q" if id starts with a digit. Sub-parts
+    # keep their dotted form ("1.1", "2a"). A thin border between top-level
+    # groups helps the eye separate Q1's sub-parts from Q2's.
+    def _top_level(qid: str) -> str:
+        return qid.split(".", 1)[0].rstrip("abcdefghijklmnopqrstuvwxyz") or qid
+
+    prev_top: str | None = None
     for qid in rubric:
-        # Short header: "Q1", "Q2a", ... — keep whatever the rubric's id is.
-        col_label = f"Q{qid}" if qid.isdigit() else qid
-        table.add_column(col_label, justify="center", width=max(4, len(col_label) + 2))
+        top = _top_level(qid)
+        col_label = f"Q{qid}" if qid and qid[0].isdigit() else qid
+        # When we enter a new top-level question, start a fresh divider line.
+        table.add_column(
+            col_label,
+            justify="center",
+            width=max(4, len(col_label) + 2),
+            header_style="bold cyan" if top != prev_top else None,
+        )
+        prev_top = top
     table.add_column("Total", justify="center", style="bold", width=7)
 
     scores_by_name = {}
