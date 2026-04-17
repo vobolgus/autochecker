@@ -676,7 +676,9 @@ class AnimatedPhaseColumn(ProgressColumn):
     """
 
     ACTIVE_PHRASES = ("writing answer", "reasoning", "finishing", "thinking")
-    FRAMES = ("", " ·", " · ·", " · · ·")
+    # Every frame is the same visible width so the progress bar to the right
+    # doesn't shift as the ellipsis breathes.
+    FRAMES = ("      ", " ·    ", " · ·  ", " · · ·")
     FRAMES_PER_SECOND = 2  # 0.5 s per frame → 2 s full cycle
 
     def render(self, task):
