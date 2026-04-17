@@ -98,15 +98,21 @@ To change the rubric, edit `QUESTION_POINTS` in `src/autochecker/__init__.py`
 
 ## Spreadsheet integration (optional)
 
-If a file named `cyprus-ai-training.xlsx` is found in the current directory
-(or its parent), `autochecker` will:
+If any `.xlsx` roster is found in the current directory (or its parent),
+`autochecker` will:
 
-1. Read the `SpringComps` worksheet's Name/Surname columns as the roster.
-2. Ask Codex to match each student file-prefix to a roster row.
-3. On confirmation, write each student's total score into column F.
+1. Pick the first sheet that has a recognizable name header (or the first
+   sheet if none match).
+2. Detect **name / surname / score** columns from the header row. Recognized
+   headers include `name`, `first name`, `surname`, `last name`, `score`,
+   `total`, `grade`, `points`, and their Russian equivalents (`имя`,
+   `фамилия`, `балл`, `оценка`). Fallback: columns **B / C / F**.
+3. Ask Codex to match each student file-prefix to a roster row.
+4. On confirmation, write each student's total into the detected score column.
 
-Matched names appear in the results table; unmatched prefixes are listed in
-a warning panel so you can rename files and re-run.
+The resolved sheet name and column letters are printed before matching so
+you can verify. Matched names appear in the results table; unmatched
+prefixes are listed in a warning panel so you can rename files and re-run.
 
 ## Configuration
 

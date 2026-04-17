@@ -24,8 +24,8 @@
 #   build/   *.egg-info/                   setuptools / pipx build artifacts
 #   .DS_Store                              macOS Finder metadata
 #   .idea/                                 JetBrains IDE config (per-machine)
-#   mathweek*/   week*/   anything else    grading input — personal data
-#   cyprus-ai-training.xlsx                student roster — personal data
+#   *.xlsx                                 student rosters — personal data
+#   any grading directory                  student submissions — personal data
 #
 # Rationale: grading dirs contain handwritten scans with student names/work
 # and the roster spreadsheet contains personal data. Keep them local-only.

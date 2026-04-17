@@ -205,8 +205,8 @@ def find_solutions_file(directory: Path) -> Path | None:
     return None
 
 
-def find_submissions(directory: Path, solutions_file: Path) -> dict[str, list[Path]]:
-    groups = defaultdict(list)
+def _collect_submission_files(directory: Path, solutions_file: Path) -> list[Path]:
+    out = []
     for f in sorted(directory.iterdir()):
         if f == solutions_file:
             continue
@@ -214,18 +214,59 @@ def find_submissions(directory: Path, solutions_file: Path) -> dict[str, list[Pa
             continue
         if f.name.startswith("."):
             continue
-        stem = f.stem
-        prefix = stem.rstrip("0123456789") or stem
-        groups[prefix].append(f)
-    return dict(groups)
+        out.append(f)
+    return out
+
+
+def _autodetect_grouping(files: list[Path]) -> str:
+    """Pick 'prefix' (many students × multi-page) vs 'per-file' (one-PDF-per-student).
+
+    Heuristic: if all files collapse to a single stripped-digits prefix AND
+    there are at least 5 files, each file is almost certainly a separate
+    student (e.g., `img-<timestamp>.pdf`). Otherwise use prefix grouping.
+    """
+    if len(files) < 5:
+        return "prefix"
+    prefixes = {(f.stem.rstrip("0123456789") or f.stem) for f in files}
+    return "per-file" if len(prefixes) == 1 else "prefix"
+
+
+def find_submissions(directory: Path, solutions_file: Path,
+                     mode: str = "auto") -> tuple[dict[str, list[Path]], str]:
+    """Return (groups, resolved_mode).
+
+    `mode` is one of 'auto', 'prefix', 'per-file'. With 'auto', the mode is
+    chosen by `_autodetect_grouping`. The resolved mode is returned so the
+    caller can display it.
+    """
+    files = _collect_submission_files(directory, solutions_file)
+    resolved = _autodetect_grouping(files) if mode == "auto" else mode
+
+    groups: dict[str, list[Path]] = defaultdict(list)
+    if resolved == "per-file":
+        for f in files:
+            groups[f.stem].append(f)
+    else:  # 'prefix'
+        for f in files:
+            stem = f.stem
+            prefix = stem.rstrip("0123456789") or stem
+            groups[prefix].append(f)
+    return dict(groups), resolved
 
 
 def find_spreadsheet(directory: Path) -> Path | None:
-    target = "cyprus-ai-training.xlsx"
+    """Return the first .xlsx file in `directory` or its parent, ignoring
+    Excel temp files (`~$*.xlsx`). Returns None if none found."""
     for search_dir in [directory, directory.parent]:
-        candidate = search_dir / target
-        if candidate.exists():
-            return candidate
+        try:
+            candidates = sorted(
+                p for p in search_dir.glob("*.xlsx")
+                if not p.name.startswith("~$") and not p.name.startswith(".")
+            )
+        except OSError:
+            candidates = []
+        if candidates:
+            return candidates[0]
     return None
 
 
@@ -350,32 +391,119 @@ def match_names(model: str, timeout: int, file_prefixes: list[str],
 
 # ── Spreadsheet ──────────────────────────────────────────────────────
 
-def read_roster(spreadsheet_path: Path) -> list[tuple[str, str]]:
-    wb = openpyxl.load_workbook(spreadsheet_path)
-    ws = wb["SpringComps"]
-    roster = []
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-        name, surname = row[1].value, row[2].value
-        if name and surname:
-            roster.append((str(name), str(surname)))
-    wb.close()
-    return roster
+def _col_letter(idx: int) -> str:
+    """0-based column index → Excel-style letter (0 → A, 1 → B, ...)."""
+    n = idx
+    letters = ""
+    while True:
+        letters = chr(ord("A") + n % 26) + letters
+        n = n // 26 - 1
+        if n < 0:
+            break
+    return letters
 
 
-def write_scores(spreadsheet_path: Path, scores_by_name: dict[tuple[str, str], int]) -> int:
+NAME_HEADERS = ("name", "first name", "firstname", "given", "имя")
+SURNAME_HEADERS = ("surname", "last name", "lastname", "family", "фамилия")
+SCORE_HEADERS = ("score", "total", "grade", "points", "mark",
+                 "оценка", "балл", "итог")
+
+# Fallback column indices (0-based) used when headers can't be detected.
+FALLBACK_NAME_COL = 1      # column B
+FALLBACK_SURNAME_COL = 2   # column C
+FALLBACK_SCORE_COL = 5     # column F
+
+
+def _detect_roster_columns(ws) -> tuple[int, int, int]:
+    """Inspect row 1 for name/surname/score headers. Return 0-based indices;
+    fall back to B/C/F if a header can't be matched."""
+    name_col = surname_col = score_col = None
+    header_row = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+    for i, cell in enumerate(header_row):
+        if cell is None:
+            continue
+        text = str(cell).strip().lower()
+        if name_col is None and any(h == text or h in text for h in NAME_HEADERS):
+            # Prefer exact match for "name" over substrings like "surname".
+            if "surname" in text or "last" in text or "family" in text or "фамилия" in text:
+                pass
+            else:
+                name_col = i
+        if surname_col is None and any(h in text for h in SURNAME_HEADERS):
+            surname_col = i
+        if score_col is None and any(h in text for h in SCORE_HEADERS):
+            score_col = i
+    return (
+        FALLBACK_NAME_COL if name_col is None else name_col,
+        FALLBACK_SURNAME_COL if surname_col is None else surname_col,
+        FALLBACK_SCORE_COL if score_col is None else score_col,
+    )
+
+
+def _pick_roster_sheet(wb, preferred: str | None = None):
+    """Return the worksheet to use as roster. Prefer `preferred` if given,
+    otherwise the first sheet whose row-1 has a detectable name header,
+    otherwise the first sheet."""
+    if preferred and preferred in wb.sheetnames:
+        return wb[preferred]
+    for name in wb.sheetnames:
+        ws = wb[name]
+        header = next(ws.iter_rows(min_row=1, max_row=1, values_only=True), ())
+        for cell in header:
+            if cell is None:
+                continue
+            text = str(cell).strip().lower()
+            if any(h in text for h in NAME_HEADERS + SURNAME_HEADERS):
+                return ws
+    return wb[wb.sheetnames[0]]
+
+
+def read_roster(spreadsheet_path: Path, sheet_name: str | None = None
+                ) -> tuple[list[tuple[str, str]], str, tuple[int, int, int]]:
+    """Return (roster rows, resolved sheet name, (name/surname/score cols))."""
     wb = openpyxl.load_workbook(spreadsheet_path)
-    ws = wb["SpringComps"]
-    filled = 0
-    for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
-        name, surname = row[1].value, row[2].value
-        if name and surname:
-            key = (str(name), str(surname))
-            if key in scores_by_name:
-                row[5].value = scores_by_name[key]
-                filled += 1
-    wb.save(spreadsheet_path)
-    wb.close()
-    return filled
+    try:
+        ws = _pick_roster_sheet(wb, sheet_name)
+        name_col, surname_col, score_col = _detect_roster_columns(ws)
+        roster = []
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            if max(name_col, surname_col) >= len(row):
+                continue
+            name = row[name_col].value
+            surname = row[surname_col].value
+            if name and surname:
+                roster.append((str(name), str(surname)))
+        return roster, ws.title, (name_col, surname_col, score_col)
+    finally:
+        wb.close()
+
+
+def write_scores(spreadsheet_path: Path, scores_by_name: dict[tuple[str, str], int],
+                 sheet_name: str, cols: tuple[int, int, int]) -> int:
+    name_col, surname_col, score_col = cols
+    wb = openpyxl.load_workbook(spreadsheet_path)
+    try:
+        ws = wb[sheet_name]
+        filled = 0
+        for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
+            if max(name_col, surname_col) >= len(row):
+                continue
+            name = row[name_col].value
+            surname = row[surname_col].value
+            if name and surname:
+                key = (str(name), str(surname))
+                if key in scores_by_name:
+                    # Extend the row if the score column is beyond current width.
+                    if score_col >= len(row):
+                        ws.cell(row=row[0].row, column=score_col + 1,
+                                value=scores_by_name[key])
+                    else:
+                        row[score_col].value = scores_by_name[key]
+                    filled += 1
+        wb.save(spreadsheet_path)
+        return filled
+    finally:
+        wb.close()
 
 
 # ── UI ───────────────────────────────────────────────────────────────
@@ -424,7 +552,12 @@ def render_header(state: dict):
     lines.append("  students ", style="muted")
     if groups:
         n_files = sum(len(f) for f in groups.values())
-        lines.append(f"{len(groups)} students · {n_files} files\n", style="success")
+        mode_hint = "one-per-file" if state.get("grouping") == "per-file" else "by name prefix"
+        lines.append(
+            f"{len(groups)} students · {n_files} files  ",
+            style="success",
+        )
+        lines.append(f"({mode_hint})\n", style="muted")
     else:
         lines.append("none found\n", style="warning")
 
@@ -439,7 +572,8 @@ def render_header(state: dict):
     console.print(
         "  [muted]Commands:[/] "
         "[bold]/students[/] · [bold]/crit[/] · [bold]/model[/] · "
-        "[bold]/grade[/] · [bold]/rescan[/] · [bold]/help[/] · [bold]/quit[/]"
+        "[bold]/group[/] · [bold]/grade[/] · [bold]/rescan[/] · "
+        "[bold]/help[/] · [bold]/quit[/]"
     )
 
 
@@ -450,6 +584,7 @@ def cmd_help(state: dict):
     tbl.add_row("/students", "list discovered student submissions")
     tbl.add_row("/crit", "show path to the solutions/criteria file")
     tbl.add_row("/model", "pick the Codex model (or save a default)")
+    tbl.add_row("/group", "switch grouping (prefix / per-file / auto)")
     tbl.add_row("/grade", "run grading against the solutions file")
     tbl.add_row("/rescan", "re-scan the current directory")
     tbl.add_row("/status", "re-print the header")
@@ -533,15 +668,40 @@ def cmd_model(state: dict):
             console.print(f"  [success]Saved to[/] {CONFIG_FILE}")
 
 
-def cmd_rescan(state: dict):
+def _rescan(state: dict, mode: str = "auto"):
     cwd = state["cwd"]
     state["solutions_file"] = find_solutions_file(cwd)
     if state["solutions_file"]:
-        state["groups"] = find_submissions(cwd, state["solutions_file"])
+        groups, resolved = find_submissions(cwd, state["solutions_file"], mode=mode)
+        state["groups"] = groups
+        state["grouping"] = resolved
     else:
         state["groups"] = {}
+        state["grouping"] = "prefix"
     state["spreadsheet"] = find_spreadsheet(cwd)
+
+
+def cmd_rescan(state: dict):
+    _rescan(state, mode="auto")
     console.print("  [success]Rescanned.[/]")
+    render_header(state)
+
+
+def cmd_group(state: dict):
+    current = state.get("grouping", "prefix")
+    console.print()
+    console.print(f"  [muted]Current:[/] [bold]{current}[/]")
+    console.print(
+        "  [muted]Modes:[/] "
+        "[bold]prefix[/] (group by name, strip trailing digits) · "
+        "[bold]per-file[/] (each file = one student) · "
+        "[bold]auto[/] (detect from filenames)"
+    )
+    choice = Prompt.ask("  [bold]Mode[/]", choices=["prefix", "per-file", "auto"],
+                        default=current)
+    _rescan(state, mode=choice)
+    console.print(f"  [success]Grouping →[/] [bold]{state['grouping']}[/]  "
+                  f"([bold]{len(state['groups'])}[/] students)")
     render_header(state)
 
 
@@ -600,13 +760,22 @@ def run_grading(state: dict):
 
         spreadsheet = state["spreadsheet"]
         name_map = None
+        roster_sheet = None
+        roster_cols = None
 
         if spreadsheet:
             console.print(f"\n  [info]Spreadsheet:[/] {spreadsheet.name}")
             if Confirm.ask("  [bold]Match names & fill scores?[/]", default=True):
                 with console.status("[info]Matching names to roster...[/]", spinner="dots"):
-                    roster = read_roster(spreadsheet)
+                    roster, roster_sheet, roster_cols = read_roster(spreadsheet)
                     name_map = match_names(model, timeout, list(groups.keys()), roster, tmpdir)
+                console.print(
+                    f"  [muted]Sheet:[/] [bold]{roster_sheet}[/]  "
+                    f"[muted]cols:[/] name={_col_letter(roster_cols[0])} "
+                    f"surname={_col_letter(roster_cols[1])} "
+                    f"score={_col_letter(roster_cols[2])}  "
+                    f"[muted]({len(roster)} rows)[/]"
+                )
 
         scores_by_name = render_results(grades, name_map)
 
@@ -620,9 +789,9 @@ def run_grading(state: dict):
                     )
                 )
 
-        if name_map and scores_by_name and spreadsheet:
+        if name_map and scores_by_name and spreadsheet and roster_sheet and roster_cols:
             if Confirm.ask(f"\n  [bold]Write {len(scores_by_name)} scores to[/] {spreadsheet.name}?", default=True):
-                filled = write_scores(spreadsheet, scores_by_name)
+                filled = write_scores(spreadsheet, scores_by_name, roster_sheet, roster_cols)
                 console.print(f"  [success]Done![/] Wrote {filled} scores.\n")
             else:
                 console.print("  [muted]Skipped.[/]\n")
@@ -681,6 +850,7 @@ COMMANDS = {
     "/students": cmd_students,
     "/crit": cmd_crit,
     "/model": cmd_model,
+    "/group": cmd_group,
     "/grade": run_grading,
     "/rescan": cmd_rescan,
     "/refresh": cmd_rescan,
@@ -692,7 +862,10 @@ def build_state() -> dict:
     config = load_config()
     cwd = Path.cwd()
     solutions_file = find_solutions_file(cwd)
-    groups = find_submissions(cwd, solutions_file) if solutions_file else {}
+    if solutions_file:
+        groups, grouping = find_submissions(cwd, solutions_file, mode="auto")
+    else:
+        groups, grouping = {}, "prefix"
     spreadsheet = find_spreadsheet(cwd)
     return {
         "config": config,
@@ -700,6 +873,7 @@ def build_state() -> dict:
         "model": config.get("default_model"),
         "solutions_file": solutions_file,
         "groups": groups,
+        "grouping": grouping,
         "spreadsheet": spreadsheet,
     }
 
