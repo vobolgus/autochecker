@@ -255,19 +255,17 @@ def find_submissions(directory: Path, solutions_file: Path,
 
 
 def find_spreadsheet(directory: Path) -> Path | None:
-    """Return the first .xlsx file in `directory` or its parent, ignoring
-    Excel temp files (`~$*.xlsx`). Returns None if none found."""
-    for search_dir in [directory, directory.parent]:
-        try:
-            candidates = sorted(
-                p for p in search_dir.glob("*.xlsx")
-                if not p.name.startswith("~$") and not p.name.startswith(".")
-            )
-        except OSError:
-            candidates = []
-        if candidates:
-            return candidates[0]
-    return None
+    """Return the first .xlsx file in `directory`, ignoring Excel temp
+    files (`~$*.xlsx`). Only the current directory is searched — parents
+    are not, to avoid silently picking up unrelated rosters."""
+    try:
+        candidates = sorted(
+            p for p in directory.glob("*.xlsx")
+            if not p.name.startswith("~$") and not p.name.startswith(".")
+        )
+    except OSError:
+        candidates = []
+    return candidates[0] if candidates else None
 
 
 # ── Codex wrapper ────────────────────────────────────────────────────

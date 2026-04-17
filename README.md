@@ -98,8 +98,7 @@ To change the rubric, edit `QUESTION_POINTS` in `src/autochecker/__init__.py`
 
 ## Spreadsheet integration (optional)
 
-If any `.xlsx` roster is found in the current directory (or its parent),
-`autochecker` will:
+If any `.xlsx` roster is found in the current directory, `autochecker` will:
 
 1. Pick the first sheet that has a recognizable name header (or the first
    sheet if none match).
