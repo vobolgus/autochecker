@@ -19,9 +19,12 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from collections import defaultdict
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
+from typing import Callable
 
 import fitz  # pymupdf
 import openpyxl
@@ -278,11 +281,14 @@ def check_codex_available():
 
 
 def codex_exec(prompt: str, image_paths: list[Path], schema: dict, model: str | None,
-               workdir: Path, timeout: int, tag: str) -> dict:
+               workdir: Path, timeout: int, tag: str,
+               on_event: Callable[[dict], None] | None = None) -> dict:
     """Run `codex exec` non-interactively and return the parsed JSON result.
 
-    Uses --output-schema to force structured output and --output-last-message
-    to capture the final agent message into a file (rather than parsing stdout).
+    With `--json`, Codex prints JSONL events as it works. Each event is passed
+    to `on_event` so the caller can surface live progress (reasoning steps,
+    token counts, etc.). The final JSON response is still read from the file
+    written by `--output-last-message` once the process exits.
     """
     schema_path = workdir / f"schema_{tag}.json"
     schema_path.write_text(json.dumps(schema))
@@ -294,6 +300,7 @@ def codex_exec(prompt: str, image_paths: list[Path], schema: dict, model: str | 
     # the positional prompt as another image path.
     cmd = [
         "codex", "exec",
+        "--json",
         "--sandbox", "read-only",
         "--skip-git-repo-check",
         "--ephemeral",
@@ -309,22 +316,54 @@ def codex_exec(prompt: str, image_paths: list[Path], schema: dict, model: str | 
         abs_imgs = [str(Path(p).resolve()) for p in image_paths]
         cmd.extend(["-i", ",".join(abs_imgs)])
 
-    try:
-        proc = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=timeout,
-            cwd=str(workdir),
-            stdin=subprocess.DEVNULL,
-        )
-    except subprocess.TimeoutExpired:
-        raise RuntimeError(f"codex exec timed out after {timeout}s")
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,   # merge so we read a single stream
+        text=True,
+        bufsize=1,                  # line-buffered
+        cwd=str(workdir),
+        stdin=subprocess.DEVNULL,
+    )
 
-    if proc.returncode != 0:
-        err = (proc.stderr or proc.stdout or "").strip().splitlines()
-        tail = " | ".join(err[-5:])[:400]
-        raise RuntimeError(f"codex exec failed (rc={proc.returncode}): {tail}")
+    # Hard timeout — kill the process if it takes too long.
+    timed_out = {"flag": False}
+    def _kill():
+        timed_out["flag"] = True
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    timer = threading.Timer(timeout, _kill)
+    timer.daemon = True
+    timer.start()
+
+    non_json: list[str] = []
+    try:
+        assert proc.stdout is not None
+        for raw_line in proc.stdout:
+            line = raw_line.rstrip("\n")
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                non_json.append(line)
+                continue
+            if on_event is not None:
+                try:
+                    on_event(event)
+                except Exception:
+                    pass  # never let a UI callback kill the subprocess loop
+        rc = proc.wait()
+    finally:
+        timer.cancel()
+
+    if timed_out["flag"]:
+        raise RuntimeError(f"codex exec timed out after {timeout}s")
+    if rc != 0:
+        tail = " | ".join(non_json[-5:])[:400] or f"exit code {rc}"
+        raise RuntimeError(f"codex exec failed (rc={rc}): {tail}")
 
     if not result_path.exists():
         raise RuntimeError("codex exec produced no result file")
@@ -342,16 +381,48 @@ def codex_exec(prompt: str, image_paths: list[Path], schema: dict, model: str | 
         raise RuntimeError(f"codex exec returned invalid JSON: {e}; raw={raw[:200]}")
 
 
+def event_phase(event: dict, counters: dict) -> str | None:
+    """Map a Codex JSONL event to a short human phase label, or None to skip.
+
+    `counters` is a per-call dict used to accumulate things like
+    reasoning-step count across events.
+    """
+    et = event.get("type", "")
+    if et == "thread.started":
+        return "session opened"
+    if et == "turn.started":
+        return "thinking"
+    if et in ("item.started", "item.completed"):
+        item = event.get("item") or {}
+        itype = item.get("type", "")
+        if itype == "reasoning":
+            if et == "item.completed":
+                counters["reasoning"] = counters.get("reasoning", 0) + 1
+                return f"reasoning · step {counters['reasoning']}"
+            return "reasoning"
+        if itype == "agent_message":
+            return "writing answer"
+        if itype in ("function_call", "exec_command"):
+            return "tool call"
+        return None
+    if et == "turn.completed":
+        usage = event.get("usage") or {}
+        out_tok = usage.get("output_tokens")
+        return f"finishing · {out_tok} tok" if out_tok is not None else "finishing"
+    return None
+
+
 # ── Grading ──────────────────────────────────────────────────────────
 
 def grade_student(model: str, timeout: int, solutions_paths: list[Path],
                   student_prefix: str, submission_paths: list[Path],
-                  workdir: Path) -> dict:
+                  workdir: Path,
+                  on_event: Callable[[dict], None] | None = None) -> dict:
     prompt = GRADING_PROMPT + f"\n\nStudent identifier: {student_prefix}"
     images = solutions_paths + submission_paths
     try:
         result = codex_exec(prompt, images, GRADING_SCHEMA, model, workdir, timeout,
-                            tag=f"grade_{student_prefix}")
+                            tag=f"grade_{student_prefix}", on_event=on_event)
     except RuntimeError as e:
         return {
             "scores": {str(i): 0 for i in range(1, 10)},
@@ -742,11 +813,20 @@ def run_grading(state: dict):
         ) as progress:
             task = progress.add_task("Grading", total=len(groups))
             for prefix, files in groups.items():
-                progress.update(task, description=f"Grading [bold]{prefix}[/]")
+                progress.update(task, description=f"Grading [bold]{prefix}[/] · starting")
+                counters: dict = {}
+                def on_event(event, _prefix=prefix, _counters=counters):
+                    phase = event_phase(event, _counters)
+                    if phase:
+                        progress.update(
+                            task,
+                            description=f"Grading [bold]{_prefix}[/] · [muted]{phase}[/]",
+                        )
                 try:
                     submission_paths = materialize_submission(files, tmpdir, prefix)
                     result = grade_student(model, timeout, solutions_paths, prefix,
-                                           submission_paths, tmpdir)
+                                           submission_paths, tmpdir,
+                                           on_event=on_event)
                 except Exception as e:
                     err_msg = str(e)[:160]
                     progress.console.print(f"  [error]Failed {prefix}:[/] {err_msg}")
