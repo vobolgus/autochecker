@@ -95,29 +95,95 @@ theme = Theme({
 })
 console = Console(theme=theme)
 
-# ── Constants ────────────────────────────────────────────────────────
+# ── Rubric / grading prompts (built dynamically from the solutions file) ──
 
-QUESTION_POINTS = {1: 2, 2: 2, 3: 3, 4: 2, 5: 3, 6: 2, 7: 2, 8: 2, 9: 4}
-TOTAL_POINTS = sum(QUESTION_POINTS.values())  # 22
+# Fallback rubric if auto-detection from the solutions file fails.
+DEFAULT_RUBRIC: dict[str, int] = {"1": 2, "2": 2, "3": 3, "4": 2, "5": 3}
 
-GRADING_SCHEMA = {
+
+def make_grading_schema(rubric: dict[str, int]) -> dict:
+    """Build a JSON Schema for a grading response from an ordered rubric."""
+    return {
+        "type": "object",
+        "properties": {
+            "scores": {
+                "type": "object",
+                "properties": {
+                    qid: {"type": "integer", "minimum": 0, "maximum": mx}
+                    for qid, mx in rubric.items()
+                },
+                "required": list(rubric.keys()),
+                "additionalProperties": False,
+            },
+            "total": {"type": "integer", "minimum": 0,
+                      "maximum": sum(rubric.values())},
+            "notes": {"type": "string"},
+        },
+        "required": ["scores", "total", "notes"],
+        "additionalProperties": False,
+    }
+
+
+def make_grading_prompt(rubric: dict[str, int]) -> str:
+    total = sum(rubric.values())
+    return f"""\
+You are grading a student's handwritten submission against the provided \
+official solutions.
+
+The problem set has {len(rubric)} question(s). \
+Point values per question: {json.dumps(rubric)}. Total: {total} points.
+
+The attached images contain:
+  1. The official worked solutions (first pages).
+  2. The student's handwritten submission (remaining pages).
+
+GRADING INSTRUCTIONS:
+- For each question the student attempted, compare their work against the official solution.
+- Award points based on correctness and completeness. Partial credit is allowed.
+- If a question is not attempted, give 0 points.
+- Be fair but rigorous. Minor notation differences are OK. The key steps must be present.
+
+Return ONLY the JSON object matching the provided schema. Do not run tools, do not edit files, \
+do not ask clarifying questions.
+"""
+
+
+RUBRIC_SCHEMA = {
     "type": "object",
     "properties": {
-        "scores": {
-            "type": "object",
-            "properties": {
-                str(q): {"type": "integer", "minimum": 0, "maximum": mx}
-                for q, mx in QUESTION_POINTS.items()
+        "questions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string"},
+                    "points": {"type": "integer", "minimum": 1, "maximum": 100},
+                },
+                "required": ["id", "points"],
+                "additionalProperties": False,
             },
-            "required": [str(q) for q in QUESTION_POINTS],
-            "additionalProperties": False,
+            "minItems": 1,
+            "maxItems": 30,
         },
-        "total": {"type": "integer", "minimum": 0, "maximum": TOTAL_POINTS},
-        "notes": {"type": "string"},
     },
-    "required": ["scores", "total", "notes"],
+    "required": ["questions"],
     "additionalProperties": False,
 }
+
+RUBRIC_PROMPT = """\
+Look at the attached worked-solutions pages and extract the grading rubric.
+
+For each question in the problem set, return:
+  - "id":     the question label exactly as written (e.g. "1", "2a", "Задача 3")
+  - "points": the maximum points for that question (positive integer)
+
+Return JSON of the form:
+  {"questions": [{"id": "1", "points": 2}, {"id": "2", "points": 3}, ...]}
+
+Preserve the order the questions appear in the document. If point values are \
+not explicitly printed, infer reasonable integers from context. Do not run \
+tools, do not ask clarifying questions.
+"""
 
 NAME_DETECT_SCHEMA = {
     "type": "object",
@@ -139,27 +205,6 @@ Return JSON matching the schema:
 
 Keep the original script (Cyrillic stays Cyrillic). Do not guess from the \
 filename. Do not run tools.
-"""
-
-GRADING_PROMPT = f"""\
-You are grading a student's math competition submission. The competition has 9 questions on \
-linear regression (Gaussian noise, normal equations, ridge regularization).
-
-Point values per question: {json.dumps(QUESTION_POINTS)}
-Total: {TOTAL_POINTS} points.
-
-The attached images contain:
-  1. The official worked solutions (first pages).
-  2. The student's handwritten submission (remaining pages).
-
-GRADING INSTRUCTIONS:
-- For each question the student attempted, compare their work against the official solution.
-- Award points based on correctness and completeness. Partial credit is allowed.
-- If a question is not attempted, give 0 points.
-- Be fair but rigorous. Minor notation differences are OK. The key mathematical steps must be present.
-
-Return ONLY the JSON object matching the provided schema. Do not run tools, do not edit files, \
-do not ask clarifying questions.
 """
 
 NAME_MATCH_SCHEMA = {
@@ -477,25 +522,54 @@ def event_thought(event: dict, max_len: int = 220) -> str | None:
 
 # ── Grading ──────────────────────────────────────────────────────────
 
-def grade_student(model: str, timeout: int, solutions_paths: list[Path],
+def grade_student(model: str | None, timeout: int, solutions_paths: list[Path],
                   student_prefix: str, submission_paths: list[Path],
-                  workdir: Path,
+                  workdir: Path, rubric: dict[str, int],
                   on_event: Callable[[dict], None] | None = None) -> dict:
-    prompt = GRADING_PROMPT + f"\n\nStudent identifier: {student_prefix}"
+    prompt = make_grading_prompt(rubric) + f"\n\nStudent identifier: {student_prefix}"
+    schema = make_grading_schema(rubric)
     images = solutions_paths + submission_paths
+    empty_scores = {qid: 0 for qid in rubric}
     try:
-        result = codex_exec(prompt, images, GRADING_SCHEMA, model, workdir, timeout,
+        result = codex_exec(prompt, images, schema, model, workdir, timeout,
                             tag=f"grade_{student_prefix}", on_event=on_event)
     except RuntimeError as e:
         return {
-            "scores": {str(i): 0 for i in range(1, 10)},
+            "scores": dict(empty_scores),
             "total": 0,
             "notes": f"ERROR: {str(e)[:200]}",
         }
-    scores = result.get("scores", {})
-    result.setdefault("total", sum(int(scores.get(str(q), 0)) for q in QUESTION_POINTS))
+    scores = result.get("scores") or {}
+    # Coerce and fill missing keys with 0 so the table never has gaps.
+    result["scores"] = {qid: int(scores.get(qid, 0)) for qid in rubric}
+    result.setdefault("total", sum(result["scores"].values()))
     result.setdefault("notes", "")
     return result
+
+
+def detect_rubric(model: str | None, timeout: int,
+                  solutions_paths: list[Path], workdir: Path,
+                  on_event: Callable[[dict], None] | None = None
+                  ) -> dict[str, int] | None:
+    """Ask Codex to read the solutions PDF and extract a question → points map.
+
+    Returns an ordered dict (insertion preserved), or None if extraction
+    fails or looks suspicious (empty / non-positive values).
+    """
+    try:
+        result = codex_exec(RUBRIC_PROMPT, solutions_paths, RUBRIC_SCHEMA,
+                            model, workdir, timeout, tag="rubric",
+                            on_event=on_event)
+    except RuntimeError:
+        return None
+    questions = result.get("questions") or []
+    rubric: dict[str, int] = {}
+    for q in questions:
+        qid = q.get("id")
+        pts = q.get("points")
+        if qid and isinstance(pts, int) and pts > 0:
+            rubric[str(qid).strip()] = int(pts)
+    return rubric or None
 
 
 def detect_student_name(model: str | None, timeout: int,
@@ -914,6 +988,27 @@ def run_grading(state: dict):
         with console.status("[info]Rendering solutions...[/]", spinner="dots"):
             solutions_paths = render_pdf_pages(sol, tmpdir, "solutions")
 
+        # ── Detect rubric from the solutions file ────────────────────────
+        with console.status("[info]Reading rubric from solutions...[/]", spinner="dots"):
+            rubric = detect_rubric(model, timeout, solutions_paths, tmpdir)
+        if rubric is None:
+            console.print(
+                "  [warning]Could not auto-detect rubric from solutions.[/] "
+                f"Falling back to default {len(DEFAULT_RUBRIC)}-question rubric."
+            )
+            rubric = dict(DEFAULT_RUBRIC)
+
+        rubric_preview = "  ".join(f"{qid}:{pts}" for qid, pts in rubric.items())
+        console.print(
+            f"  [success]Rubric:[/] [bold]{len(rubric)}[/] questions · "
+            f"[bold]{sum(rubric.values())}[/] points total   "
+            f"[muted]({rubric_preview})[/]"
+        )
+        if not Confirm.ask("  [bold]Use this rubric?[/]", default=True):
+            console.print("  [muted]Aborted. Edit the solutions file or tweak "
+                          "the rubric manually and retry.[/]")
+            return
+
         grades = {}
         detected_names: dict[str, str | None] = {}
         console.print()
@@ -957,7 +1052,7 @@ def run_grading(state: dict):
                 except Exception as e:
                     err_msg = str(e)[:160]
                     progress.console.print(f"  [error]Failed {prefix}:[/] {err_msg}")
-                    grades[prefix] = {"scores": {str(i): 0 for i in range(1, 10)},
+                    grades[prefix] = {"scores": {qid: 0 for qid in rubric},
                                       "total": 0, "notes": f"ERROR: {err_msg}"}
                     detected_names[prefix] = None
                     progress.advance(task)
@@ -1002,12 +1097,12 @@ def run_grading(state: dict):
 
                 try:
                     result = grade_student(model, timeout, solutions_paths, prefix,
-                                           submission_paths, tmpdir,
+                                           submission_paths, tmpdir, rubric,
                                            on_event=on_event_grade)
                 except Exception as e:
                     err_msg = str(e)[:160]
                     progress.console.print(f"  [error]Failed {prefix}:[/] {err_msg}")
-                    result = {"scores": {str(i): 0 for i in range(1, 10)}, "total": 0,
+                    result = {"scores": {qid: 0 for qid in rubric}, "total": 0,
                               "notes": f"ERROR: {err_msg}"}
                 result["detected_name"] = name
                 grades[prefix] = result
@@ -1037,7 +1132,7 @@ def run_grading(state: dict):
                     f"[muted]({len(roster)} rows)[/]"
                 )
 
-        scores_by_name = render_results(grades, name_map)
+        scores_by_name = render_results(grades, rubric, name_map)
 
         if name_map:
             unmatched = [p for p in grades if name_map.get(p) is None]
@@ -1059,9 +1154,11 @@ def run_grading(state: dict):
             console.print()
 
 
-def render_results(grades: dict, name_map: dict | None = None) -> dict[tuple[str, str], int]:
+def render_results(grades: dict, rubric: dict[str, int],
+                   name_map: dict | None = None) -> dict[tuple[str, str], int]:
     has_matches = name_map is not None
     has_signed = any(r.get("detected_name") for r in grades.values())
+    total_max = sum(rubric.values())
 
     table = Table(border_style="cyan", title="Results", title_style="bold cyan", show_lines=True)
     table.add_column("#", style="muted", width=3, justify="right")
@@ -1070,8 +1167,10 @@ def render_results(grades: dict, name_map: dict | None = None) -> dict[tuple[str
         table.add_column("Signed as", no_wrap=True)
     if has_matches:
         table.add_column("Matched To", no_wrap=True)
-    for q in range(1, 10):
-        table.add_column(f"Q{q}", justify="center", width=4)
+    for qid in rubric:
+        # Short header: "Q1", "Q2a", ... — keep whatever the rubric's id is.
+        col_label = f"Q{qid}" if qid.isdigit() else qid
+        table.add_column(col_label, justify="center", width=max(4, len(col_label) + 2))
     table.add_column("Total", justify="center", style="bold", width=7)
 
     scores_by_name = {}
@@ -1081,13 +1180,12 @@ def render_results(grades: dict, name_map: dict | None = None) -> dict[tuple[str
         detected = result.get("detected_name")
 
         q_cells = []
-        for q in range(1, 10):
-            s = scores.get(str(q), 0)
-            mx = QUESTION_POINTS[q]
+        for qid, mx in rubric.items():
+            s = int(scores.get(qid, 0))
             q_cells.append(f"[{score_style(s, mx)}]{s}[/]/{mx}")
 
-        style = score_style(total, TOTAL_POINTS)
-        total_cell = f"[{style}]{total}[/]/{TOTAL_POINTS}"
+        style = score_style(total, total_max)
+        total_cell = f"[{style}]{total}[/]/{total_max}"
 
         row = [str(i), prefix]
         if has_signed:
