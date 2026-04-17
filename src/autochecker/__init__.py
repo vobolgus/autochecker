@@ -31,7 +31,10 @@ import openpyxl
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
+from rich.progress import (
+    Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn,
+    TimeElapsedColumn, ProgressColumn,
+)
 from rich.prompt import Prompt, Confirm
 from rich.table import Table
 from rich.text import Text
@@ -115,6 +118,28 @@ GRADING_SCHEMA = {
     "required": ["scores", "total", "notes"],
     "additionalProperties": False,
 }
+
+NAME_DETECT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "name": {"type": ["string", "null"]},
+    },
+    "required": ["name"],
+    "additionalProperties": False,
+}
+
+NAME_DETECT_PROMPT = """\
+Look at the attached scanned student submission pages. Your only job is to \
+find the student's name or signature if they wrote one anywhere on the pages \
+(header, corner, signature line, etc.).
+
+Return JSON matching the schema:
+  {"name": "<full name as written>"}   if a name is clearly visible
+  {"name": null}                       if no name or it's unreadable
+
+Keep the original script (Cyrillic stays Cyrillic). Do not guess from the \
+filename. Do not run tools.
+"""
 
 GRADING_PROMPT = f"""\
 You are grading a student's math competition submission. The competition has 9 questions on \
@@ -473,11 +498,38 @@ def grade_student(model: str, timeout: int, solutions_paths: list[Path],
     return result
 
 
+def detect_student_name(model: str | None, timeout: int,
+                        submission_paths: list[Path],
+                        workdir: Path, tag: str,
+                        on_event: Callable[[dict], None] | None = None) -> str | None:
+    """Quick pre-check: ask Codex to read a signature off the submission.
+    Returns the detected name string, or None if none is readable/present."""
+    try:
+        result = codex_exec(
+            NAME_DETECT_PROMPT, submission_paths, NAME_DETECT_SCHEMA,
+            model, workdir, timeout, tag=f"detect_{tag}", on_event=on_event,
+        )
+    except RuntimeError:
+        return None
+    name = result.get("name")
+    if not name or not isinstance(name, str):
+        return None
+    name = name.strip()
+    return name or None
+
+
 def match_names(model: str, timeout: int, file_prefixes: list[str],
-                roster: list[tuple[str, str]], workdir: Path
+                roster: list[tuple[str, str]], workdir: Path,
+                signed_names: dict[str, str | None] | None = None,
                 ) -> dict[str, tuple[str, str] | None]:
     roster_str = "\n".join(f"  - {n} {s}" for n, s in roster)
-    groups_str = "\n".join(f"  - {p}" for p in file_prefixes)
+    if signed_names:
+        groups_str = "\n".join(
+            f"  - {p}" + (f"  (signed: {signed_names[p]})" if signed_names.get(p) else "")
+            for p in file_prefixes
+        )
+    else:
+        groups_str = "\n".join(f"  - {p}" for p in file_prefixes)
     prompt = NAME_MATCHING_PROMPT.format(file_groups=groups_str, roster=roster_str)
     try:
         result = codex_exec(prompt, [], NAME_MATCH_SCHEMA, model, workdir, timeout,
@@ -614,6 +666,29 @@ def write_scores(spreadsheet_path: Path, scores_by_name: dict[tuple[str, str], i
 
 
 # ── UI ───────────────────────────────────────────────────────────────
+
+class AnimatedPhaseColumn(ProgressColumn):
+    """TextColumn replacement that breathes ellipses after active phase words.
+
+    Cycles through a slow 4-frame ellipsis ("", "·", "··", "···") at ~0.5 Hz
+    after recognisable in-flight phrases ("thinking", "reasoning", "writing
+    answer", "finishing"). Idle descriptions render unchanged.
+    """
+
+    ACTIVE_PHRASES = ("writing answer", "reasoning", "finishing", "thinking")
+    FRAMES = ("", " ·", " · ·", " · · ·")
+    FRAMES_PER_SECOND = 2  # 0.5 s per frame → 2 s full cycle
+
+    def render(self, task):
+        desc = str(task.description or "")
+        frame = int(time.monotonic() * self.FRAMES_PER_SECOND) % len(self.FRAMES)
+        dots = self.FRAMES[frame]
+        for phrase in self.ACTIVE_PHRASES:
+            if phrase in desc:
+                desc = desc.replace(phrase, f"{phrase}{dots}", 1)
+                break
+        return Text.from_markup(desc)
+
 
 def score_style(score: int, total: int) -> str:
     ratio = score / total if total else 0
@@ -838,10 +913,11 @@ def run_grading(state: dict):
             solutions_paths = render_pdf_pages(sol, tmpdir, "solutions")
 
         grades = {}
+        detected_names: dict[str, str | None] = {}
         console.print()
         progress = Progress(
             SpinnerColumn("dots"),
-            TextColumn("[progress.description]{task.description}"),
+            AnimatedPhaseColumn(),
             BarColumn(bar_width=30, complete_style="cyan", finished_style="green"),
             TaskProgressColumn(),
             TextColumn("[muted]|[/]"),
@@ -854,31 +930,84 @@ def run_grading(state: dict):
                   refresh_per_second=8, transient=False):
             task = progress.add_task("Grading", total=len(groups))
             for prefix, files in groups.items():
-                progress.update(task, description=f"Grading [bold]{prefix}[/] · starting")
                 thought_line.plain = ""
                 counters: dict = {}
 
                 def on_event(event, _prefix=prefix, _counters=counters):
+                    # Called both during name detection and grading. We read
+                    # `_label[0]` so the phase prefix can update between stages.
                     phase = event_phase(event, _counters)
                     if phase:
                         progress.update(
                             task,
-                            description=f"Grading [bold]{_prefix}[/] · [muted]{phase}[/]",
+                            description=f"{_label[0]} [bold]{_prefix}[/] · [muted]{phase}[/]",
+                        )
+                    thought = event_thought(event)
+                    if thought:
+                        thought_line.plain = f"    ↳ {thought}"
+
+                _label = ["Reading"]  # mutable so closure picks up new prefix
+                progress.update(task,
+                                description=f"Reading [bold]{prefix}[/] · starting")
+
+                try:
+                    submission_paths = materialize_submission(files, tmpdir, prefix)
+                except Exception as e:
+                    err_msg = str(e)[:160]
+                    progress.console.print(f"  [error]Failed {prefix}:[/] {err_msg}")
+                    grades[prefix] = {"scores": {str(i): 0 for i in range(1, 10)},
+                                      "total": 0, "notes": f"ERROR: {err_msg}"}
+                    detected_names[prefix] = None
+                    progress.advance(task)
+                    continue
+
+                # ── Pre-check: read a signature off the pages ───────────────
+                name = detect_student_name(
+                    model, timeout, submission_paths, tmpdir, prefix,
+                    on_event=on_event,
+                )
+                detected_names[prefix] = name
+                if name:
+                    name_tag = f" · [bold cyan]{name}[/]"
+                    progress.console.print(f"  [muted]signed:[/] [bold cyan]{name}[/]  "
+                                           f"[muted](from {prefix})[/]")
+                else:
+                    name_tag = " · [muted]unsigned[/]"
+
+                # ── Grading pass ────────────────────────────────────────────
+                _label[0] = "Grading"
+                counters.clear()
+                thought_line.plain = ""
+                progress.update(
+                    task,
+                    description=f"Grading [bold]{prefix}[/]{name_tag} · starting",
+                )
+                # Update on_event closure to include the name_tag going forward.
+                def on_event_grade(event, _prefix=prefix, _counters=counters,
+                                   _name_tag=name_tag):
+                    phase = event_phase(event, _counters)
+                    if phase:
+                        progress.update(
+                            task,
+                            description=(
+                                f"Grading [bold]{_prefix}[/]{_name_tag} · "
+                                f"[muted]{phase}[/]"
+                            ),
                         )
                     thought = event_thought(event)
                     if thought:
                         thought_line.plain = f"    ↳ {thought}"
 
                 try:
-                    submission_paths = materialize_submission(files, tmpdir, prefix)
                     result = grade_student(model, timeout, solutions_paths, prefix,
                                            submission_paths, tmpdir,
-                                           on_event=on_event)
+                                           on_event=on_event_grade)
                 except Exception as e:
                     err_msg = str(e)[:160]
                     progress.console.print(f"  [error]Failed {prefix}:[/] {err_msg}")
                     result = {"scores": {str(i): 0 for i in range(1, 10)}, "total": 0,
                               "notes": f"ERROR: {err_msg}"}
+                result["detected_name"] = name
                 grades[prefix] = result
                 progress.advance(task)
             thought_line.plain = ""
@@ -894,7 +1023,10 @@ def run_grading(state: dict):
             if Confirm.ask("  [bold]Match names & fill scores?[/]", default=True):
                 with console.status("[info]Matching names to roster...[/]", spinner="dots"):
                     roster, roster_sheet, roster_cols = read_roster(spreadsheet)
-                    name_map = match_names(model, timeout, list(groups.keys()), roster, tmpdir)
+                    name_map = match_names(
+                        model, timeout, list(groups.keys()), roster, tmpdir,
+                        signed_names=detected_names,
+                    )
                 console.print(
                     f"  [muted]Sheet:[/] [bold]{roster_sheet}[/]  "
                     f"[muted]cols:[/] name={_col_letter(roster_cols[0])} "
@@ -927,10 +1059,13 @@ def run_grading(state: dict):
 
 def render_results(grades: dict, name_map: dict | None = None) -> dict[tuple[str, str], int]:
     has_matches = name_map is not None
+    has_signed = any(r.get("detected_name") for r in grades.values())
 
     table = Table(border_style="cyan", title="Results", title_style="bold cyan", show_lines=True)
     table.add_column("#", style="muted", width=3, justify="right")
     table.add_column("Student", style="bold", no_wrap=True)
+    if has_signed:
+        table.add_column("Signed as", no_wrap=True)
     if has_matches:
         table.add_column("Matched To", no_wrap=True)
     for q in range(1, 10):
@@ -941,6 +1076,7 @@ def render_results(grades: dict, name_map: dict | None = None) -> dict[tuple[str
     for i, (prefix, result) in enumerate(grades.items(), 1):
         total = result.get("total", 0)
         scores = result.get("scores", {})
+        detected = result.get("detected_name")
 
         q_cells = []
         for q in range(1, 10):
@@ -952,6 +1088,8 @@ def render_results(grades: dict, name_map: dict | None = None) -> dict[tuple[str
         total_cell = f"[{style}]{total}[/]/{TOTAL_POINTS}"
 
         row = [str(i), prefix]
+        if has_signed:
+            row.append(f"[cyan]{detected}[/]" if detected else "[muted]—[/]")
         if has_matches:
             match = name_map.get(prefix)
             if match:
