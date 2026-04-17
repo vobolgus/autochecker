@@ -14,6 +14,7 @@ Run `autochecker` in any directory containing:
   - Student submission files (*.jpg, *.png, *.pdf)
 """
 
+import csv
 import json
 import shutil
 import subprocess
@@ -22,6 +23,7 @@ import tempfile
 import threading
 import time
 from collections import defaultdict
+from datetime import datetime, timezone
 from importlib.metadata import PackageNotFoundError, version as _pkg_version
 from pathlib import Path
 from typing import Callable
@@ -907,7 +909,7 @@ def render_header(state: dict):
     )
 
 
-def cmd_help(state: dict):
+def cmd_help(state: dict, *args: str):
     tbl = Table(show_header=False, box=None, padding=(0, 2), pad_edge=False)
     tbl.add_column(style="bold cyan")
     tbl.add_column()
@@ -916,6 +918,7 @@ def cmd_help(state: dict):
     tbl.add_row("/model", "pick the Codex model (or save a default)")
     tbl.add_row("/group", "switch grouping (prefix / per-file / auto)")
     tbl.add_row("/grade", "run grading against the solutions file")
+    tbl.add_row("/results", "re-show saved results (add 'full' for sub-parts)")
     tbl.add_row("/rescan", "re-scan the current directory")
     tbl.add_row("/status", "re-print the header")
     tbl.add_row("/help", "show this help")
@@ -924,7 +927,7 @@ def cmd_help(state: dict):
     console.print(tbl)
 
 
-def cmd_students(state: dict):
+def cmd_students(state: dict, *args: str):
     groups = state["groups"]
     if not groups:
         console.print("  [warning]No student submissions found in[/] " + str(state["cwd"]))
@@ -942,7 +945,7 @@ def cmd_students(state: dict):
     console.print("  [muted]Roster matching runs during /grade.[/]")
 
 
-def cmd_crit(state: dict):
+def cmd_crit(state: dict, *args: str):
     sol = state["solutions_file"]
     if not sol:
         console.print(f"  [warning]No *solutions*.pdf found in[/] {state['cwd']}")
@@ -959,7 +962,7 @@ def cmd_crit(state: dict):
         pass
 
 
-def cmd_model(state: dict):
+def cmd_model(state: dict, *args: str):
     config = state["config"]
     current = state["model"]
     console.print()
@@ -1011,13 +1014,52 @@ def _rescan(state: dict, mode: str = "auto"):
     state["spreadsheet"] = find_spreadsheet(cwd)
 
 
-def cmd_rescan(state: dict):
+def cmd_rescan(state: dict, *args: str):
     _rescan(state, mode="auto")
     console.print("  [success]Rescanned.[/]")
     render_header(state)
 
 
-def cmd_group(state: dict):
+def cmd_results(state: dict, *args: str):
+    """Re-render the latest results table. `/results` → compact view,
+    `/results full` → per-sub-part breakdown."""
+    full = any(a.lower() in ("full", "detail", "detailed") for a in args)
+
+    grades = state.get("last_grades")
+    rubric = state.get("last_rubric")
+    name_map = state.get("last_name_map")
+
+    if not grades or not rubric:
+        loaded = load_results(state["cwd"])
+        if not loaded:
+            console.print(
+                f"  [warning]No saved results in {state['cwd']}.[/] "
+                "Run /grade first, or cd into a directory with "
+                f"{RESULTS_FILENAME}."
+            )
+            return
+        grades = loaded["grades"]
+        rubric = loaded["rubric"]
+        name_map_raw = loaded.get("name_map")
+        name_map = None
+        if name_map_raw:
+            name_map = {k: (tuple(v) if v else None)
+                        for k, v in name_map_raw.items()}
+        state["last_grades"] = grades
+        state["last_rubric"] = rubric
+        state["last_detected_names"] = loaded.get("detected_names", {})
+        state["last_name_map"] = name_map
+        console.print(f"  [muted]Loaded results from[/] {state['cwd'] / RESULTS_FILENAME}")
+
+    has_subs = any("." in qid for qid in rubric)
+    render_results(grades, rubric, name_map, compact=(not full and has_subs))
+    if has_subs and not full:
+        console.print("  [muted]Use [bold]/results full[/muted] for per-sub-part breakdown.[/]")
+    elif has_subs and full:
+        console.print("  [muted]Use [bold]/results[/muted] for a compact view.[/]")
+
+
+def cmd_group(state: dict, *args: str):
     current = state.get("grouping", "prefix")
     console.print()
     console.print(f"  [muted]Current:[/] [bold]{current}[/]")
@@ -1035,7 +1077,7 @@ def cmd_group(state: dict):
     render_header(state)
 
 
-def run_grading(state: dict):
+def run_grading(state: dict, *args: str):
     sol = state["solutions_file"]
     groups = state["groups"]
     if not sol:
@@ -1234,7 +1276,33 @@ def run_grading(state: dict):
                     f"[muted]({len(roster)} rows)[/]"
                 )
 
-        scores_by_name = render_results(grades, rubric, name_map)
+        # Cache everything in state for /results re-renders without re-grading.
+        state["last_rubric"] = rubric
+        state["last_grades"] = grades
+        state["last_detected_names"] = detected_names
+        state["last_name_map"] = name_map
+
+        # Persist to disk so the user can re-open later or copy elsewhere.
+        try:
+            json_path, csv_path = save_results(
+                state["cwd"], rubric, grades, detected_names, name_map,
+            )
+            console.print(
+                f"\n  [success]Saved:[/] [bold]{json_path.name}[/], "
+                f"[bold]{csv_path.name}[/]  [muted](in {state['cwd']})[/]"
+            )
+        except OSError as e:
+            console.print(f"  [warning]Could not save results:[/] {e}")
+
+        # Default to compact view if there are sub-parts; otherwise flat.
+        has_subs = any("." in qid for qid in rubric)
+        scores_by_name = render_results(grades, rubric, name_map,
+                                        compact=has_subs)
+        if has_subs:
+            console.print(
+                "  [muted]Compact view shown. "
+                "Use [bold]/results full[/] for per-sub-part breakdown.[/]"
+            )
 
         if name_map:
             unmatched = [p for p in grades if name_map.get(p) is None]
@@ -1256,13 +1324,39 @@ def run_grading(state: dict):
             console.print()
 
 
+def _top_level_id(qid: str) -> str:
+    return qid.split(".", 1)[0]
+
+
+def _aggregate_by_top_level(rubric: dict[str, int]) -> dict[str, int]:
+    """Collapse a rubric with sub-parts into one entry per top-level question."""
+    out: dict[str, int] = {}
+    for qid, pts in rubric.items():
+        top = _top_level_id(qid)
+        out[top] = out.get(top, 0) + pts
+    return out
+
+
 def render_results(grades: dict, rubric: dict[str, int],
-                   name_map: dict | None = None) -> dict[tuple[str, str], int]:
+                   name_map: dict | None = None,
+                   compact: bool = False) -> dict[tuple[str, str], int]:
+    """Render the score table.
+
+    `compact=True` aggregates sub-parts (e.g. 1.1 + 1.2 + …) into one column
+    per top-level question. Useful when the rubric has many sub-parts and
+    the full breakdown would overflow the terminal.
+    """
     has_matches = name_map is not None
     has_signed = any(r.get("detected_name") for r in grades.values())
     total_max = sum(rubric.values())
 
-    table = Table(border_style="cyan", title="Results", title_style="bold cyan", show_lines=True)
+    if compact:
+        display_rubric = _aggregate_by_top_level(rubric)
+    else:
+        display_rubric = rubric
+
+    title = "Results" + (" (compact)" if compact else "")
+    table = Table(border_style="cyan", title=title, title_style="bold cyan", show_lines=True)
     table.add_column("#", style="muted", width=3, justify="right")
     table.add_column("Student", style="bold", no_wrap=True)
     if has_signed:
@@ -1270,24 +1364,10 @@ def render_results(grades: dict, rubric: dict[str, int],
     if has_matches:
         table.add_column("Matched To", no_wrap=True)
 
-    # Column labels — prefix with "Q" if id starts with a digit. Sub-parts
-    # keep their dotted form ("1.1", "2a"). A thin border between top-level
-    # groups helps the eye separate Q1's sub-parts from Q2's.
-    def _top_level(qid: str) -> str:
-        return qid.split(".", 1)[0].rstrip("abcdefghijklmnopqrstuvwxyz") or qid
-
-    prev_top: str | None = None
-    for qid in rubric:
-        top = _top_level(qid)
+    for qid in display_rubric:
         col_label = f"Q{qid}" if qid and qid[0].isdigit() else qid
-        # When we enter a new top-level question, start a fresh divider line.
-        table.add_column(
-            col_label,
-            justify="center",
-            width=max(4, len(col_label) + 2),
-            header_style="bold cyan" if top != prev_top else None,
-        )
-        prev_top = top
+        table.add_column(col_label, justify="center",
+                         width=max(4, len(col_label) + 2))
     table.add_column("Total", justify="center", style="bold", width=7)
 
     scores_by_name = {}
@@ -1296,10 +1376,20 @@ def render_results(grades: dict, rubric: dict[str, int],
         scores = result.get("scores", {})
         detected = result.get("detected_name")
 
+        # Build the per-displayed-column score cell.
         q_cells = []
-        for qid, mx in rubric.items():
-            s = int(scores.get(qid, 0))
-            q_cells.append(f"[{score_style(s, mx)}]{s}[/]/{mx}")
+        if compact:
+            # Aggregate sub-part scores into top-level buckets.
+            top_scores: dict[str, int] = defaultdict(int)
+            for qid in rubric:
+                top_scores[_top_level_id(qid)] += int(scores.get(qid, 0))
+            for top, mx in display_rubric.items():
+                s = top_scores.get(top, 0)
+                q_cells.append(f"[{score_style(s, mx)}]{s}[/]/{mx}")
+        else:
+            for qid, mx in rubric.items():
+                s = int(scores.get(qid, 0))
+                q_cells.append(f"[{score_style(s, mx)}]{s}[/]/{mx}")
 
         style = score_style(total, total_max)
         total_cell = f"[{style}]{total}[/]/{total_max}"
@@ -1323,6 +1413,66 @@ def render_results(grades: dict, rubric: dict[str, int],
     return scores_by_name
 
 
+RESULTS_FILENAME = "autochecker_results.json"
+RESULTS_CSV_FILENAME = "autochecker_results.csv"
+
+
+def save_results(cwd: Path, rubric: dict[str, int], grades: dict,
+                 detected_names: dict[str, str | None],
+                 name_map: dict | None) -> tuple[Path, Path]:
+    """Persist full grading results to JSON + CSV in the grading directory.
+    Returns (json_path, csv_path)."""
+    json_path = cwd / RESULTS_FILENAME
+    csv_path = cwd / RESULTS_CSV_FILENAME
+
+    serialisable_name_map = None
+    if name_map:
+        serialisable_name_map = {
+            k: (list(v) if v else None) for k, v in name_map.items()
+        }
+
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "version": VERSION,
+        "rubric": rubric,
+        "detected_names": detected_names,
+        "name_map": serialisable_name_map,
+        "grades": grades,
+    }
+    json_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    # CSV: one row per student, columns = prefix, signed_name, match_name,
+    # <qid>, <qid>, ..., total
+    with csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        header = ["prefix", "signed_as", "matched_to"]
+        header.extend(rubric.keys())
+        header.append("total")
+        header.append("notes")
+        writer.writerow(header)
+        for prefix, result in grades.items():
+            signed = detected_names.get(prefix) or ""
+            matched = ""
+            if name_map and name_map.get(prefix):
+                matched = " ".join(name_map[prefix])
+            scores = result.get("scores") or {}
+            row = [prefix, signed, matched]
+            row.extend(scores.get(qid, 0) for qid in rubric)
+            row.append(result.get("total", 0))
+            row.append(result.get("notes", ""))
+            writer.writerow(row)
+    return json_path, csv_path
+
+
+def load_results(cwd: Path) -> dict | None:
+    path = cwd / RESULTS_FILENAME
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data
+
+
 # ── Main ─────────────────────────────────────────────────────────────
 
 COMMANDS = {
@@ -1333,9 +1483,10 @@ COMMANDS = {
     "/model": cmd_model,
     "/group": cmd_group,
     "/grade": run_grading,
+    "/results": cmd_results,
     "/rescan": cmd_rescan,
     "/refresh": cmd_rescan,
-    "/status": lambda s: render_header(s),
+    "/status": lambda s, *a: render_header(s),
 }
 
 
@@ -1376,15 +1527,16 @@ def main():
             continue
         if cmd in ("/quit", "/exit", "/q", "quit", "exit"):
             return
-        # Tolerate commands typed without the slash.
-        lookup = cmd if cmd.startswith("/") else "/" + cmd.split()[0]
-        handler = COMMANDS.get(lookup.split()[0])
+        parts = cmd.split()
+        head = parts[0] if parts[0].startswith("/") else "/" + parts[0]
+        args = parts[1:]
+        handler = COMMANDS.get(head)
         if handler is None:
             console.print(f"  [warning]Unknown command:[/] {cmd}   "
                           f"[muted](try /help)[/]")
             continue
         try:
-            handler(state)
+            handler(state, *args)
         except KeyboardInterrupt:
             console.print("\n  [muted]Interrupted.[/]")
 
