@@ -171,18 +171,24 @@ RUBRIC_SCHEMA = {
 }
 
 RUBRIC_PROMPT = """\
-Look at the attached worked-solutions pages and extract the grading rubric.
+Look at the attached worked-solutions pages and extract the **grading rubric** \
+— i.e. the criteria a teacher would use to mark the work. This is usually \
+listed in a table, scoring guide, or criteria section at the end of the \
+solutions. It is NOT the same as the list of derivation steps inside the \
+solution itself.
 
-List EVERY atomic scorable item. If a question breaks into sub-parts (e.g. \
-"part a" / "part b", explicit points for 1.1 and 1.2, separate points for \
-each step in the solution), list each sub-part as its own item with its own \
-points. If a question has no sub-parts, list it as a single item.
+What to look for (in order of preference):
+  1. An explicit scoring table / criteria list (e.g. "Критерии оценивания", \
+"Grading rubric", a table of per-question items with points).
+  2. Labelled sub-parts of each question (part a, part b, 1.1, 1.2, etc.) with \
+points next to each.
+  3. Only if none of the above exists: use each top-level question as a single \
+item with its maximum points.
 
-For each item return:
+For each rubric item return:
   - "id":     the label as it appears in the document. Use dotted notation \
-for sub-parts: "1.1", "1.2", "2.3a", etc. Plain "1", "2" for items without \
-sub-parts.
-  - "points": the maximum points for that atomic item (positive integer)
+for sub-parts: "1.1", "1.2", "2a". Plain "1", "2" for items with no sub-parts.
+  - "points": the maximum points for that rubric item (positive integer)
 
 Return JSON of the form:
   {"questions": [
@@ -192,9 +198,9 @@ Return JSON of the form:
       ...
   ]}
 
-Preserve the order items appear in the document. If point values aren't \
-printed, infer reasonable integers so that each top-level question's parts \
-sum to the intended total. Do not run tools, do not ask questions.
+Do NOT list every derivation step in the worked solution as a separate rubric \
+item. Only list items the grading guide actually scores. Preserve the order \
+items appear. Do not run tools, do not ask questions.
 """
 
 NAME_DETECT_SCHEMA = {
@@ -557,6 +563,60 @@ def grade_student(model: str | None, timeout: int, solutions_paths: list[Path],
     result.setdefault("total", sum(result["scores"].values()))
     result.setdefault("notes", "")
     return result
+
+
+import re as _re
+
+
+def parse_rubric_pattern(spec: str) -> dict[str, int] | None:
+    """Parse shorthand rubric patterns typed by the user:
+
+        5x4@2      → 5 questions × 4 sub-parts × 2 pts each   (20 items, 40 pts)
+        5x4        → 5 × 4 with 1 pt each                     (20 items, 20 pts)
+        5@16       → 5 top-level questions × 16 pts each      (5 items,  80 pts)
+        5          → 5 top-level × 1 pt each                  (5 items,   5 pts)
+    """
+    spec = spec.strip().lower()
+    if not spec:
+        return None
+    m = _re.fullmatch(r"(\d+)x(\d+)(?:@(\d+))?", spec)
+    if m:
+        n, k = int(m.group(1)), int(m.group(2))
+        p = int(m.group(3)) if m.group(3) else 1
+        if n <= 0 or k <= 0 or p <= 0:
+            return None
+        rubric: dict[str, int] = {}
+        for q in range(1, n + 1):
+            for sub in range(1, k + 1):
+                rubric[f"{q}.{sub}"] = p
+        return rubric
+    m = _re.fullmatch(r"(\d+)(?:@(\d+))?", spec)
+    if m:
+        n = int(m.group(1))
+        p = int(m.group(2)) if m.group(2) else 1
+        if n <= 0 or p <= 0:
+            return None
+        return {str(q): p for q in range(1, n + 1)}
+    return None
+
+
+def prompt_rubric_override() -> dict[str, int] | None:
+    """Ask the user for a manual rubric pattern. Returns None on cancel."""
+    console.print()
+    console.print("  [muted]Enter a rubric pattern, or press Enter to abort:[/]")
+    console.print("    [bold]NxM@P[/]  — N questions × M parts × P pts each "
+                  "[muted](e.g. 5x4@2)[/]")
+    console.print("    [bold]NxM[/]    — N × M parts × 1 pt each")
+    console.print("    [bold]N@P[/]    — N top-level questions × P pts each")
+    console.print("    [bold]N[/]      — N top-level questions × 1 pt each")
+    while True:
+        spec = Prompt.ask("  [bold]Rubric[/]", default="").strip()
+        if not spec:
+            return None
+        rubric = parse_rubric_pattern(spec)
+        if rubric:
+            return rubric
+        console.print(f"  [warning]Unrecognised pattern:[/] {spec}")
 
 
 def detect_rubric(model: str | None, timeout: int,
@@ -1037,9 +1097,19 @@ def run_grading(state: dict):
         console.print(header)
         console.print(f"          [muted]{rubric_preview}[/]")
         if not Confirm.ask("  [bold]Use this rubric?[/]", default=True):
-            console.print("  [muted]Aborted. Edit the solutions file or tweak "
-                          "the rubric manually and retry.[/]")
-            return
+            override = prompt_rubric_override()
+            if override is None:
+                console.print("  [muted]Aborted.[/]")
+                return
+            rubric = override
+            by_top = defaultdict(list)
+            for qid, pts in rubric.items():
+                by_top[qid.split(".", 1)[0]].append((qid, pts))
+            console.print(
+                f"  [success]Manual rubric:[/] [bold]{len(by_top)}[/] questions · "
+                f"[bold]{len(rubric)}[/] atomic items · "
+                f"[bold]{sum(rubric.values())}[/] points total"
+            )
 
         grades = {}
         detected_names: dict[str, str | None] = {}
