@@ -1,0 +1,53 @@
+# ════════════════════════════════════════════════════════════════════════════
+# Reverse .gitignore — allowlist-style
+# ════════════════════════════════════════════════════════════════════════════
+#
+# Everything is ignored by default. A file enters the repository only when
+# its path is explicitly un-ignored with `!` below. To add a new tracked
+# path, add the corresponding `!` rule here first.
+#
+# Project layout:
+#
+#   AutoChecker/
+#   ├── .gitignore                      ← this file (tracked)
+#   ├── LICENSE                         ← MIT license (tracked)
+#   ├── README.md                       ← usage + install docs (tracked)
+#   ├── pyproject.toml                  ← build + runtime deps (tracked)
+#   └── src/
+#       └── autochecker/
+#           └── __init__.py             ← entire CLI, REPL, Codex wrapper
+#
+# Deliberately NOT tracked:
+#
+#   .venv/                                 local Python environment
+#   __pycache__/   *.pyc                   Python bytecode
+#   build/   *.egg-info/                   setuptools / pipx build artifacts
+#   .DS_Store                              macOS Finder metadata
+#   .idea/                                 JetBrains IDE config (per-machine)
+#   mathweek*/   week*/   anything else    grading input — personal data
+#   cyprus-ai-training.xlsx                student roster — personal data
+#
+# Rationale: grading dirs contain handwritten scans with student names/work
+# and the roster spreadsheet contains personal data. Keep them local-only.
+
+
+# ─── Default: deny everything at repo root ──────────────────────────────────
+/*
+
+
+# ─── Top-level metadata we track ────────────────────────────────────────────
+!/.gitignore
+!/LICENSE
+!/README.md
+!/pyproject.toml
+
+
+# ─── Python source tree ─────────────────────────────────────────────────────
+# Allow the src/ → src/autochecker/ → *.py path, re-ignore build artifacts.
+!/src
+/src/*
+!/src/autochecker
+/src/autochecker/**
+!/src/autochecker/**/*.py
+/src/autochecker/**/__pycache__
+/src/autochecker/**/*.egg-info
