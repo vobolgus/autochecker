@@ -28,7 +28,8 @@ from typing import Callable
 
 import fitz  # pymupdf
 import openpyxl
-from rich.console import Console
+from rich.console import Console, Group
+from rich.live import Live
 from rich.panel import Panel
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn, TimeElapsedColumn
 from rich.prompt import Prompt, Confirm
@@ -305,6 +306,10 @@ def codex_exec(prompt: str, image_paths: list[Path], schema: dict, model: str | 
         "--skip-git-repo-check",
         "--ephemeral",
         "--color", "never",
+        # Surface the model's internal reasoning as JSONL events so the UI
+        # can display live "thoughts" while a call is in flight.
+        "-c", "show_raw_agent_reasoning=true",
+        "-c", 'model_reasoning_summary="auto"',
         "--output-schema", str(schema_path),
         "--output-last-message", str(result_path),
     ]
@@ -410,6 +415,39 @@ def event_phase(event: dict, counters: dict) -> str | None:
         out_tok = usage.get("output_tokens")
         return f"finishing · {out_tok} tok" if out_tok is not None else "finishing"
     return None
+
+
+def event_thought(event: dict, max_len: int = 220) -> str | None:
+    """Pull a single-line excerpt of reasoning text out of a reasoning event.
+
+    Codex emits reasoning as `item.completed` events with `item.type ==
+    "reasoning"` and a markdown-ish `text` field. We pick the last
+    meaningful line, strip markdown decoration, and trim to `max_len`.
+    """
+    if event.get("type") != "item.completed":
+        return None
+    item = event.get("item") or {}
+    if item.get("type") != "reasoning":
+        return None
+    text = (item.get("text") or "").strip()
+    if not text:
+        return None
+    # Take the last non-trivial line (skip pure markdown headers).
+    lines = [l.strip() for l in text.splitlines() if l.strip()]
+    pick = None
+    for line in reversed(lines):
+        cleaned = line.strip("*").strip("#").strip()
+        if cleaned:
+            pick = cleaned
+            break
+    if pick is None:
+        pick = lines[-1]
+    # Collapse whitespace, strip stray markdown tokens.
+    pick = " ".join(pick.split())
+    pick = pick.replace("**", "").replace("`", "")
+    if len(pick) > max_len:
+        pick = pick[: max_len - 1].rstrip() + "…"
+    return pick
 
 
 # ── Grading ──────────────────────────────────────────────────────────
@@ -801,7 +839,7 @@ def run_grading(state: dict):
 
         grades = {}
         console.print()
-        with Progress(
+        progress = Progress(
             SpinnerColumn("dots"),
             TextColumn("[progress.description]{task.description}"),
             BarColumn(bar_width=30, complete_style="cyan", finished_style="green"),
@@ -810,11 +848,16 @@ def run_grading(state: dict):
             TimeElapsedColumn(),
             console=console,
             transient=False,
-        ) as progress:
+        )
+        thought_line = Text("", style="muted", no_wrap=True, overflow="ellipsis")
+        with Live(Group(progress, thought_line), console=console,
+                  refresh_per_second=8, transient=False):
             task = progress.add_task("Grading", total=len(groups))
             for prefix, files in groups.items():
                 progress.update(task, description=f"Grading [bold]{prefix}[/] · starting")
+                thought_line.plain = ""
                 counters: dict = {}
+
                 def on_event(event, _prefix=prefix, _counters=counters):
                     phase = event_phase(event, _counters)
                     if phase:
@@ -822,6 +865,10 @@ def run_grading(state: dict):
                             task,
                             description=f"Grading [bold]{_prefix}[/] · [muted]{phase}[/]",
                         )
+                    thought = event_thought(event)
+                    if thought:
+                        thought_line.plain = f"    ↳ {thought}"
+
                 try:
                     submission_paths = materialize_submission(files, tmpdir, prefix)
                     result = grade_student(model, timeout, solutions_paths, prefix,
@@ -834,6 +881,7 @@ def run_grading(state: dict):
                               "notes": f"ERROR: {err_msg}"}
                 grades[prefix] = result
                 progress.advance(task)
+            thought_line.plain = ""
             progress.update(task, description="[success]Grading complete[/]")
 
         spreadsheet = state["spreadsheet"]
